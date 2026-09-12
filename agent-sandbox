@@ -1,0 +1,955 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM="agent-sandbox"
+VERSION="0.2.0-mvp"
+STATE_ROOT="${AGENT_SANDBOX_STATE_ROOT:-${HOME}/.local/state/agent-sandbox}"
+SESSIONS_DIR="${STATE_ROOT}/sessions"
+DEFAULT_PORT="3181"
+DEFAULT_CONTROL_SOURCE="${AGENT_SANDBOX_CONTROL_SOURCE:-${HOME}/deepseek-harness}"
+DEFAULT_HOST_DSH_HOME="${AGENT_SANDBOX_DSH_HOME:-${HOME}/.dsh}"
+DEFAULT_CREDENTIALS_DIR="tests/test-credentials"
+RELAY_PORT="38080"
+IMAGE_BASE="${AGENT_SANDBOX_IMAGE:-dsh-agent-sandbox:mvp2}"
+
+usage() {
+  cat <<'USAGE'
+agent-sandbox — persistent-staging Docker workspace for DSH/agent development
+
+Usage:
+  agent-sandbox [start] [OPTIONS] [WORKSPACE]
+  agent-sandbox resume [SESSION]
+  agent-sandbox stop [SESSION]
+  agent-sandbox finish [SESSION]
+  agent-sandbox apply [SESSION]
+  agent-sandbox status [SESSION]
+  agent-sandbox logs [SESSION]
+  agent-sandbox list
+  agent-sandbox image-build
+  agent-sandbox clean [--force] [SESSION]
+
+Start options:
+  -p, --port PORT             Host/Main DSH WebUI port (default: 3181)
+  -n, --name NAME             Friendly session name (default: repo name)
+      --control-source PATH   Trusted DSH source used only to run the control WebUI
+                              (default: ~/deepseek-harness)
+      --dsh-home PATH         Real DSH_HOME to snapshot for the control instance
+                              (default: ~/.dsh)
+      --credentials PATH      Test credentials directory inside the real workspace;
+                              excluded from the copy and mounted read-only
+                              (default: tests/test-credentials; ignored if absent)
+      --no-credentials        Do not mount a test credentials directory
+      --image IMAGE           Docker image override
+      --rebuild-image         Rebuild the default sandbox image before start
+  -h, --help                  Show this help
+
+Lifecycle:
+  start   Create a persistent staging session and start its container.
+  stop    Stop the container only. Workspace and control-home staging remain intact.
+  resume  Restart the same staged session after stop/crash.
+  finish  Stop, export a code patch, and guarded-merge canonical conversation history
+          + attachments back into the real DSH_HOME. Settings/credentials/profiles/
+          storages are NOT written back.
+  clean   Delete the staged session only after a successful finish; --force is destructive.
+
+Typical use:
+  cd ~/src/dsh-agent-team
+  agent-sandbox --port 3181 .
+  # work in http://127.0.0.1:3181
+  agent-sandbox stop
+  agent-sandbox resume
+  agent-sandbox finish
+  agent-sandbox apply        # optional local patch path; PR workflow needs explicit GitHub auth
+  agent-sandbox clean
+
+Architecture:
+  - Real project is never mounted. A self-contained Git clone + filesystem overlay is staged.
+  - The staged workspace is mounted at the SAME absolute path inside the container as the real
+    project. DSH therefore records the real project cwd while actually writing only the copy.
+  - Trusted control DSH source is mounted read-only at /control-dsh.
+  - Real ~/.dsh is snapshotted to session/control-home (cache excluded) and mounted RW at
+    /control-home. This staging directory survives Docker/WSL process restarts.
+  - Main DSH runs from /control-dsh with process.cwd() set to the staged workspace path and
+    DSH_HOME=/control-home. The built-in workspace-write policy therefore targets the copy.
+  - tests/deepseek-harness and tests/homes inside the workspace are ordinary RW test fixtures.
+  - tests/test-credentials, if present, is a read-only overlay from the real project.
+  - /var/run/docker.sock, the real HOME, and Windows drives are not mounted.
+  - Container user matches the WSL user's UID/GID, is non-root, has no capabilities, and cannot
+    gain privileges.
+  - Networking is normal Docker outbound networking. This MVP protects host files; it is not an
+    egress/data-exfiltration sandbox.
+
+Persistence contract:
+  - Code/test work is continuously durable in the host-side session/workspace staging directory.
+  - DSH conversation state is continuously durable in session/control-home.
+  - finish writes back only canonical session log files (append/add only) and attachments/v1
+    (add only). It never writes settings.yaml, .credentials.yaml, profiles, storages, cache, etc.
+  - Unknown changed files inside a Session artifact directory cause finish to fail closed.
+  - On conflict/failure, the staged session is retained and the real repository is untouched.
+USAGE
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+info() { echo "==> $*"; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+sanitize_name() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-48
+}
+
+shell_quote() { printf '%q' "$1"; }
+
+write_meta() {
+  local f="$1"; shift
+  : > "$f"
+  chmod 600 "$f"
+  while (($#)); do
+    local k="$1" v="$2"; shift 2
+    printf '%s=%q\n' "$k" "$v" >> "$f"
+  done
+}
+
+append_meta() {
+  local f="$1"; shift
+  while (($#)); do
+    local k="$1" v="$2"; shift 2
+    printf '%s=%q\n' "$k" "$v" >> "$f"
+  done
+}
+
+load_meta() {
+  local session_dir="$1"
+  [[ -f "$session_dir/meta.env" ]] || die "Missing session metadata: $session_dir/meta.env"
+  # shellcheck disable=SC1090
+  source "$session_dir/meta.env"
+}
+
+session_dirs() {
+  mkdir -p "$SESSIONS_DIR"
+  find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+}
+
+container_running() {
+  local name="$1"
+  docker inspect "$name" >/dev/null 2>&1 \
+    && [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]
+}
+
+resolve_session() {
+  local query="${1:-}"
+  mkdir -p "$SESSIONS_DIR"
+
+  if [[ -n "$query" ]]; then
+    if [[ -d "$SESSIONS_DIR/$query" ]]; then
+      printf '%s\n' "$SESSIONS_DIR/$query"
+      return
+    fi
+    local matches=()
+    while IFS= read -r m; do [[ -n "$m" ]] && matches+=("$m"); done < <(
+      find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -name "*${query}*" -printf '%p\n' 2>/dev/null
+    )
+    [[ "${#matches[@]}" -eq 1 ]] || die "Session '$query' is missing or ambiguous. Run: $PROGRAM list"
+    printf '%s\n' "${matches[0]}"
+    return
+  fi
+
+  local running=() all=() id sd
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    sd="$SESSIONS_DIR/$id"
+    [[ -f "$sd/meta.env" ]] || continue
+    all+=("$sd")
+    load_meta "$sd"
+    if container_running "$CONTAINER_NAME"; then running+=("$sd"); fi
+  done < <(session_dirs)
+
+  if [[ "${#running[@]}" -eq 1 ]]; then
+    printf '%s\n' "${running[0]}"
+  elif [[ "${#running[@]}" -gt 1 ]]; then
+    die "Multiple sessions are running; specify one. Run: $PROGRAM list"
+  elif [[ "${#all[@]}" -eq 1 ]]; then
+    printf '%s\n' "${all[0]}"
+  else
+    die "Specify a session. Run: $PROGRAM list"
+  fi
+}
+
+image_tag_for_host() {
+  printf '%s-u%s-g%s' "$IMAGE_BASE" "$(id -u)" "$(id -g)"
+}
+
+build_image() {
+  need_cmd docker
+  local uid gid image
+  uid=$(id -u); gid=$(id -g); image=$(image_tag_for_host)
+  info "Building sandbox image: $image (UID=$uid GID=$gid)"
+  docker build \
+    --build-arg AGENT_UID="$uid" \
+    --build-arg AGENT_GID="$gid" \
+    -t "$image" - <<'DOCKERFILE'
+FROM node:24-bookworm
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       bash ca-certificates curl git gh procps less file socat rsync \
+       python3 python3-venv python3-pip build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+# Corepack keeps pnpm selection project-owned through packageManager instead of baking one
+# fast-moving DSH pnpm version into the sandbox image.
+RUN npm install -g corepack@latest && corepack enable
+# Browser runtime libraries only; each project controls its Playwright package/browser version.
+RUN npx -y playwright@latest install-deps chromium \
+    && rm -rf /root/.npm/_npx /root/.cache
+RUN set -eux; \
+    if getent passwd node >/dev/null; then \
+      old_gid="$(id -g node)"; \
+      if [ "$old_gid" != "$AGENT_GID" ]; then \
+        if getent group "$AGENT_GID" >/dev/null; then usermod -g "$AGENT_GID" node; \
+        else groupmod -g "$AGENT_GID" node; fi; \
+      fi; \
+      usermod -u "$AGENT_UID" -l agent -d /home/agent -m node; \
+      current_group="$(id -gn agent)"; \
+      if [ "$current_group" = "node" ]; then groupmod -n agent node; fi; \
+    else \
+      if ! getent group "$AGENT_GID" >/dev/null; then groupadd -g "$AGENT_GID" agent; fi; \
+      group_name="$(getent group "$AGENT_GID" | cut -d: -f1)"; \
+      useradd -m -u "$AGENT_UID" -g "$group_name" -s /bin/bash agent; \
+    fi; \
+    mkdir -p /workspace-placeholder /control-home; \
+    chown "$AGENT_UID:$AGENT_GID" /workspace-placeholder /control-home
+ENV HOME=/home/agent
+USER agent
+WORKDIR /home/agent
+CMD ["bash"]
+DOCKERFILE
+  echo "$image"
+}
+
+ensure_image() {
+  local rebuild="${1:-false}" image
+  image=$(image_tag_for_host)
+  if [[ "$rebuild" == "true" ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
+    build_image >&2
+  fi
+  printf '%s\n' "$image"
+}
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
+  else
+    return 1
+  fi
+}
+
+assert_control_source() {
+  local src="$1"
+  [[ -d "$src/.git" || -f "$src/.git" ]] || die "Control source is not a Git worktree: $src"
+  [[ -f "$src/apps/cli/src/bin.ts" ]] || die "Control source does not look like deepseek-harness: $src"
+  [[ -d "$src/node_modules" ]] || die "Control source has no node_modules. Prepare it outside the sandbox first: cd $(shell_quote "$src") && pnpm install"
+  [[ -z "$(git -C "$src" status --porcelain=v1 --untracked-files=normal)" ]] \
+    || die "Control DSH source must be clean/stable for the lifetime of a sandbox: $src"
+  [[ -e "$src/node_modules/tsx/package.json" ]] \
+    || die "Control source cannot find node_modules/tsx. Run its dependency install first: $src"
+}
+
+control_source_commit() {
+  git -C "$1" rev-parse HEAD
+}
+
+check_control_source_unchanged() {
+  local src="$1" expected="$2"
+  [[ -d "$src" ]] || die "Control source disappeared: $src"
+  local now
+  now=$(git -C "$src" rev-parse HEAD 2>/dev/null) || die "Cannot read control source Git state: $src"
+  [[ "$now" == "$expected" ]] || die "Control DSH moved from $expected to $now. Keep the control source pinned while this session exists."
+  [[ -z "$(git -C "$src" status --porcelain=v1 --untracked-files=normal)" ]] \
+    || die "Control DSH source became dirty. Restore it before resuming this sandbox."
+}
+
+copy_workspace() {
+  local real_repo="$1" ws="$2" cred_rel="$3" use_credentials="$4"
+  local head branch origin
+  head=$(git -C "$real_repo" rev-parse HEAD)
+  branch=$(git -C "$real_repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  origin=$(git -C "$real_repo" remote get-url origin 2>/dev/null || true)
+
+  # A local clone makes .git self-contained even when REAL_REPO itself is a Git worktree.
+  git clone --quiet --no-hardlinks --no-checkout "$real_repo" "$ws"
+  git -C "$ws" checkout --quiet --detach "$head"
+  if [[ -n "$origin" ]]; then git -C "$ws" remote set-url origin "$origin"; fi
+
+  local args=(-aH --delete --exclude='/.git')
+  if [[ "$use_credentials" == "true" && -d "$real_repo/$cred_rel" ]]; then
+    args+=("--exclude=/$cred_rel/")
+  fi
+  rsync "${args[@]}" "$real_repo/" "$ws/"
+
+  # Give the agent a dedicated branch name. This does not touch the real repo.
+  local safe_branch="agent/$(basename "$(dirname "$ws")")"
+  git -C "$ws" switch --quiet -c "$safe_branch" "$head" 2>/dev/null || true
+
+  printf '%s\t%s\t%s\n' "$head" "$branch" "$origin"
+}
+
+make_baseline() {
+  local ws="$1" head tree baseline
+  head=$(git -C "$ws" rev-parse HEAD) || die "Session workspace must have a valid Git HEAD"
+  git -C "$ws" add -A
+  tree=$(git -C "$ws" write-tree)
+  baseline=$(printf 'agent-sandbox launch baseline\n' | \
+    env GIT_AUTHOR_NAME='Agent Sandbox' GIT_AUTHOR_EMAIL='agent-sandbox@localhost' \
+        GIT_COMMITTER_NAME='Agent Sandbox' GIT_COMMITTER_EMAIL='agent-sandbox@localhost' \
+    git -C "$ws" commit-tree "$tree" -p "$head")
+  git -C "$ws" reset --mixed "$head" >/dev/null
+  printf '%s\n' "$baseline"
+}
+
+snapshot_control_home() {
+  local host_home="$1" control_home="$2"
+  mkdir -p "$control_home"
+  chmod 700 "$control_home"
+  if [[ -d "$host_home" ]]; then
+    # cache is explicitly regenerable. Everything else is staged so existing profiles,
+    # settings, credentials, sessions, attachments and plugin state are available.
+    rsync -aH --delete --exclude='/cache/' "$host_home/" "$control_home/"
+  fi
+}
+
+make_durable_baseline() {
+  local control_home="$1" out="$2"
+  python3 - "$control_home" "$out" <<'PY'
+import hashlib, json, os, re, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+out = Path(sys.argv[2])
+canon = re.compile(r'^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$')
+
+def digest(p: Path):
+    h = hashlib.sha256()
+    with p.open('rb') as f:
+        for b in iter(lambda: f.read(1024*1024), b''):
+            h.update(b)
+    return {'size': p.stat().st_size, 'sha256': h.hexdigest()}
+
+entries = {}
+unknown_session_files = {}
+sessions = root / 'sessions'
+if sessions.is_dir():
+    for p in sessions.rglob('*'):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if p.name == 'session.lock':
+            continue
+        if canon.fullmatch(p.name):
+            entries[rel] = {'kind':'session', **digest(p)}
+        else:
+            unknown_session_files[rel] = digest(p)
+attachments = root / 'attachments' / 'v1'
+if attachments.is_dir():
+    for p in attachments.rglob('*'):
+        if p.is_file():
+            rel = p.relative_to(root).as_posix()
+            entries[rel] = {'kind':'attachment', **digest(p)}
+obj = {'version':1, 'entries':entries, 'unknown_session_files':unknown_session_files}
+out.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+PY
+}
+
+export_patch() {
+  local session_dir="$1"
+  load_meta "$session_dir"
+  local ws="$WORKSPACE_COPY" patch="$session_dir/changes.patch"
+  if [[ ! -d "$ws/.git" && ! -f "$ws/.git" ]]; then
+    warn "Session workspace no longer contains .git; cannot export a Git patch."
+    : > "$patch"
+    return 1
+  fi
+  git -C "$ws" add -A
+  git -C "$ws" diff --cached --binary "$BASELINE_COMMIT" > "$patch"
+  printf '%s\n' "$patch"
+}
+
+merge_durable_state() {
+  local session_dir="$1"
+  load_meta "$session_dir"
+  local report="$session_dir/history-merge-report.json"
+  python3 - "$CONTROL_HOME_COPY" "$HOST_DSH_HOME" "$DURABLE_BASELINE" "$report" <<'PY'
+import errno, fcntl, hashlib, json, os, re, shutil, sys, tempfile
+from pathlib import Path
+stage = Path(sys.argv[1])
+host = Path(sys.argv[2])
+baseline_path = Path(sys.argv[3])
+report_path = Path(sys.argv[4])
+base = json.loads(baseline_path.read_text(encoding='utf-8'))
+canon = re.compile(r'^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$')
+
+def digest(p: Path, limit=None):
+    h = hashlib.sha256(); remaining = limit
+    with p.open('rb') as f:
+        while True:
+            n = 1024*1024 if remaining is None else min(1024*1024, remaining)
+            if n <= 0: break
+            b = f.read(n)
+            if not b: break
+            h.update(b)
+            if remaining is not None: remaining -= len(b)
+    return h.hexdigest()
+
+def same_file(p: Path, meta):
+    return p.is_file() and p.stat().st_size == meta['size'] and digest(p) == meta['sha256']
+
+def prefix_matches(p: Path, meta):
+    return p.is_file() and p.stat().st_size >= meta['size'] and digest(p, meta['size']) == meta['sha256']
+
+def file_is_prefix(a: Path, b: Path):
+    if not a.is_file() or not b.is_file() or a.stat().st_size > b.stat().st_size: return False
+    ha = hashlib.sha256(); hb = hashlib.sha256(); remaining = a.stat().st_size
+    with a.open('rb') as fa, b.open('rb') as fb:
+        while remaining:
+            n = min(1024*1024, remaining)
+            ba, bb = fa.read(n), fb.read(n)
+            if ba != bb: return False
+            remaining -= len(ba)
+            if not ba and remaining: return False
+    return True
+
+def scan_stage():
+    entries = {}; unknown = {}
+    sroot = stage/'sessions'
+    if sroot.is_dir():
+        for p in sroot.rglob('*'):
+            if not p.is_file(): continue
+            rel = p.relative_to(stage).as_posix()
+            if p.name == 'session.lock': continue
+            if canon.fullmatch(p.name):
+                entries[rel] = {'kind':'session', 'size':p.stat().st_size, 'sha256':digest(p)}
+            else:
+                unknown[rel] = {'size':p.stat().st_size, 'sha256':digest(p)}
+    aroot = stage/'attachments'/'v1'
+    if aroot.is_dir():
+        for p in aroot.rglob('*'):
+            if p.is_file():
+                rel = p.relative_to(stage).as_posix()
+                entries[rel] = {'kind':'attachment','size':p.stat().st_size,'sha256':digest(p)}
+    return entries, unknown
+
+def lock_is_free(session_file: Path):
+    lock = session_file.parent/'session.lock'
+    if not lock.exists(): return True
+    fd = os.open(lock, os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        finally:
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError: pass
+        return True
+    finally:
+        os.close(fd)
+
+def publish_new(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = dst.parent / f'.agent-sandbox-{os.getpid()}-{dst.name}.tmp'
+    with src.open('rb') as fi, tmp.open('xb') as fo:
+        shutil.copyfileobj(fi, fo, 1024*1024)
+        fo.flush(); os.fsync(fo.fileno())
+    try:
+        os.link(tmp, dst)
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.unlink(missing_ok=True)
+    dfd = os.open(dst.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+
+def append_tail(src: Path, dst: Path, offset: int):
+    with src.open('rb') as fi, dst.open('ab', buffering=0) as fo:
+        fi.seek(offset)
+        while True:
+            b = fi.read(1024*1024)
+            if not b: break
+            fo.write(b)
+        os.fsync(fo.fileno())
+
+stage_entries, stage_unknown = scan_stage()
+base_entries = base.get('entries', {})
+base_unknown = base.get('unknown_session_files', {})
+conflicts = []
+actions = []
+
+# Future/unknown Session-owned artifacts fail closed if they changed in staging.
+all_unknown = set(base_unknown) | set(stage_unknown)
+for rel in sorted(all_unknown):
+    if base_unknown.get(rel) != stage_unknown.get(rel):
+        conflicts.append({'path':rel,'reason':'unknown session artifact changed; launcher has no safe merge rule'})
+
+# Deletions of canonical durable state are never propagated.
+for rel, meta in base_entries.items():
+    if rel not in stage_entries:
+        conflicts.append({'path':rel,'reason':'durable artifact deleted inside sandbox; host deletion is refused'})
+
+for rel, smeta in sorted(stage_entries.items()):
+    src = stage/rel; dst = host/rel; bmeta = base_entries.get(rel)
+    kind = smeta['kind']
+    if bmeta is None:
+        if not dst.exists():
+            actions.append({'op':'new','kind':kind,'rel':rel})
+        elif same_file(dst, smeta):
+            actions.append({'op':'already','kind':kind,'rel':rel})
+        else:
+            conflicts.append({'path':rel,'reason':'new sandbox artifact already exists on host with different bytes'})
+        continue
+
+    if smeta['size'] == bmeta['size'] and smeta['sha256'] == bmeta['sha256']:
+        continue
+
+    if kind == 'attachment':
+        conflicts.append({'path':rel,'reason':'existing attachment changed; attachments are immutable/add-only'})
+        continue
+
+    # Existing session logs may only grow from the launch baseline.
+    if not prefix_matches(src, bmeta):
+        conflicts.append({'path':rel,'reason':'session log rewrote/truncated its launch baseline; append-only merge refused'})
+        continue
+    if not dst.exists():
+        conflicts.append({'path':rel,'reason':'host session artifact from launch baseline disappeared'})
+        continue
+    if not lock_is_free(dst):
+        conflicts.append({'path':rel,'reason':'host session is currently write-locked by another DSH process'})
+        continue
+    if not prefix_matches(dst, bmeta):
+        conflicts.append({'path':rel,'reason':'host session diverged from launch baseline'})
+        continue
+    if same_file(dst, smeta):
+        actions.append({'op':'already','kind':kind,'rel':rel})
+    elif file_is_prefix(dst, src):
+        actions.append({'op':'append','kind':kind,'rel':rel,'offset':dst.stat().st_size})
+    else:
+        conflicts.append({'path':rel,'reason':'host and sandbox session tails diverged'})
+
+report = {'version':1,'conflicts':conflicts,'planned':actions,'applied':[]}
+if conflicts:
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding='utf-8')
+    print(f'CONFLICTS={len(conflicts)}')
+    sys.exit(2)
+
+host.mkdir(parents=True, exist_ok=True)
+for act in actions:
+    rel = act['rel']; src = stage/rel; dst = host/rel
+    if act['op'] == 'already':
+        report['applied'].append(act); continue
+    if act['op'] == 'new':
+        # Re-check at publication time to stay fail-closed under a race.
+        if dst.exists():
+            if same_file(dst, stage_entries[rel]):
+                report['applied'].append({'op':'already','kind':act['kind'],'rel':rel}); continue
+            raise RuntimeError(f'race: destination appeared with different bytes: {rel}')
+        publish_new(src, dst)
+        report['applied'].append(act); continue
+    if act['op'] == 'append':
+        # Re-check lock and prefix immediately before write. A partially completed prior finish
+        # is accepted when the current host remains a prefix of the staged final log.
+        if not lock_is_free(dst): raise RuntimeError(f'race: host session became write-locked: {rel}')
+        if not file_is_prefix(dst, src): raise RuntimeError(f'race: host session changed before append: {rel}')
+        offset = dst.stat().st_size
+        if offset < src.stat().st_size:
+            append_tail(src, dst, offset)
+        report['applied'].append({'op':'append','kind':act['kind'],'rel':rel,'offset':offset})
+
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding='utf-8')
+print(f'CONFLICTS=0 APPLIED={len(report["applied"])}')
+PY
+}
+
+container_mount_args() {
+  # Loaded metadata provides WORKSPACE_COPY, WORKSPACE_MOUNT, CONTROL_SOURCE,
+  # CONTROL_HOME_COPY, REAL_REPO, CRED_REL, USE_CREDENTIALS.
+  MOUNTS=(
+    --mount "type=bind,src=$WORKSPACE_COPY,dst=$WORKSPACE_MOUNT"
+    --mount "type=bind,src=$CONTROL_SOURCE,dst=/control-dsh,readonly"
+    --mount "type=bind,src=$CONTROL_HOME_COPY,dst=/control-home"
+  )
+  if [[ "$USE_CREDENTIALS" == "true" && -d "$REAL_REPO/$CRED_REL" ]]; then
+    MOUNTS+=(--mount "type=bind,src=$REAL_REPO/$CRED_REL,dst=$WORKSPACE_MOUNT/$CRED_REL,readonly")
+  fi
+}
+
+run_container() {
+  local session_dir="$1"
+  load_meta "$session_dir"
+  check_control_source_unchanged "$CONTROL_SOURCE" "$CONTROL_COMMIT"
+  port_in_use "$PORT" && die "Port $PORT is already listening on the WSL host"
+  container_mount_args
+
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  info "Starting container: $CONTAINER_NAME"
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --cap-drop=ALL \
+    --security-opt no-new-privileges:true \
+    --shm-size=1g \
+    -p "127.0.0.1:${PORT}:${RELAY_PORT}" \
+    -e HOME=/home/agent \
+    -e DSH_HOME=/control-home \
+    -e DSH_PERMISSION_MODE=workspace-write \
+    -e DSH_PORT="$PORT" \
+    -e RELAY_PORT="$RELAY_PORT" \
+    -e WORKSPACE_PATH="$WORKSPACE_MOUNT" \
+    "${MOUNTS[@]}" \
+    "$IMAGE" \
+    bash -lc '
+      set -Eeuo pipefail
+      mkdir -p "$DSH_HOME"
+      tsx_loader="$(cd /control-dsh && node -p "require.resolve(\"tsx/esm\")")"
+      socat TCP-LISTEN:"$RELAY_PORT",bind=0.0.0.0,fork,reuseaddr TCP:127.0.0.1:"$DSH_PORT" &
+      relay_pid=$!
+      trap "kill $relay_pid 2>/dev/null || true" EXIT
+      cd "$WORKSPACE_PATH"
+      exec node --import "$tsx_loader" /control-dsh/apps/cli/src/bin.ts web --port "$DSH_PORT"
+    ' >/dev/null
+
+  local i
+  for i in $(seq 1 45); do
+    if ! container_running "$CONTAINER_NAME"; then
+      warn "Container exited during startup. Recent logs:"
+      docker logs --tail 160 "$CONTAINER_NAME" 2>&1 || true
+      return 1
+    fi
+    if docker exec "$CONTAINER_NAME" bash -lc "curl -sS --max-time 1 -o /dev/null http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  warn "Container is running but the DSH WebUI did not answer within 45 seconds."
+  docker logs --tail 160 "$CONTAINER_NAME" 2>&1 || true
+  return 1
+}
+
+cmd_start() {
+  need_cmd docker; need_cmd git; need_cmd rsync; need_cmd python3
+
+  local port="$DEFAULT_PORT" name="" control_source="$DEFAULT_CONTROL_SOURCE" host_dsh_home="$DEFAULT_HOST_DSH_HOME"
+  local cred_rel="$DEFAULT_CREDENTIALS_DIR" use_credentials=true rebuild=false image_override="" workspace_arg="."
+
+  while (($#)); do
+    case "$1" in
+      -p|--port) port="${2:?missing port}"; shift 2 ;;
+      -n|--name) name="${2:?missing name}"; shift 2 ;;
+      --control-source) control_source="${2:?missing path}"; shift 2 ;;
+      --dsh-home) host_dsh_home="${2:?missing path}"; shift 2 ;;
+      --credentials) cred_rel="${2:?missing path}"; shift 2 ;;
+      --no-credentials) use_credentials=false; shift ;;
+      --image) image_override="${2:?missing image}"; shift 2 ;;
+      --rebuild-image) rebuild=true; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; workspace_arg="${1:-.}"; shift || true; break ;;
+      -*) die "Unknown option: $1" ;;
+      *) workspace_arg="$1"; shift ;;
+    esac
+  done
+
+  [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1024 && port <= 65535)) || die "Invalid port: $port"
+  port_in_use "$port" && die "Port $port is already listening on the WSL host"
+
+  local real_repo
+  real_repo=$(realpath "$workspace_arg")
+  [[ -d "$real_repo" ]] || die "Workspace not found: $real_repo"
+  git -C "$real_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not a Git worktree: $real_repo"
+
+  control_source=$(realpath "$control_source")
+  host_dsh_home=$(realpath -m "$host_dsh_home")
+  assert_control_source "$control_source"
+  local control_commit
+  control_commit=$(control_source_commit "$control_source")
+
+  local repo_name ts safe_name session_id session_dir ws_copy control_home baseline_file
+  repo_name=$(basename "$real_repo")
+  ts=$(date +%Y%m%d-%H%M%S)
+  safe_name=$(sanitize_name "${name:-$repo_name}")
+  session_id="${ts}-${safe_name}-p${port}"
+  session_dir="$SESSIONS_DIR/$session_id"
+  ws_copy="$session_dir/workspace"
+  control_home="$session_dir/control-home"
+  baseline_file="$session_dir/durable-baseline.json"
+
+  mkdir -p "$session_dir"
+  chmod 700 "$session_dir"
+  info "Creating persistent staging session: $session_id"
+
+  local copy_info base_head base_branch origin
+  copy_info=$(copy_workspace "$real_repo" "$ws_copy" "$cred_rel" "$use_credentials")
+  IFS=$'\t' read -r base_head base_branch origin <<<"$copy_info"
+  if [[ "$use_credentials" == "true" && -d "$real_repo/$cred_rel" ]]; then
+    mkdir -p "$ws_copy/$cred_rel"
+  fi
+
+  local baseline
+  baseline=$(make_baseline "$ws_copy")
+
+  info "Snapshotting DSH_HOME into persistent staging (cache excluded)"
+  snapshot_control_home "$host_dsh_home" "$control_home"
+  make_durable_baseline "$control_home" "$baseline_file"
+
+  local image
+  if [[ -n "$image_override" ]]; then
+    image="$image_override"
+    docker image inspect "$image" >/dev/null 2>&1 || die "Docker image not found: $image"
+  else
+    image=$(ensure_image "$rebuild")
+  fi
+
+  local container
+  container=$(sanitize_name "agent-sandbox-${session_id}")
+  local real_dirty="false"
+  [[ -z "$(git -C "$real_repo" status --porcelain=v1 --untracked-files=normal)" ]] || real_dirty="true"
+
+  write_meta "$session_dir/meta.env" \
+    SESSION_ID "$session_id" \
+    REAL_REPO "$real_repo" \
+    WORKSPACE_COPY "$ws_copy" \
+    WORKSPACE_MOUNT "$real_repo" \
+    BASELINE_COMMIT "$baseline" \
+    BASE_HEAD "$base_head" \
+    BASE_BRANCH "$base_branch" \
+    REAL_REPO_DIRTY "$real_dirty" \
+    CONTAINER_NAME "$container" \
+    PORT "$port" \
+    CRED_REL "$cred_rel" \
+    USE_CREDENTIALS "$use_credentials" \
+    IMAGE "$image" \
+    CONTROL_SOURCE "$control_source" \
+    CONTROL_COMMIT "$control_commit" \
+    HOST_DSH_HOME "$host_dsh_home" \
+    CONTROL_HOME_COPY "$control_home" \
+    DURABLE_BASELINE "$baseline_file" \
+    FINISH_STATUS "open"
+
+  if ! run_container "$session_dir"; then
+    echo "Session staging is preserved at: $session_dir" >&2
+    exit 1
+  fi
+
+  echo
+  echo "Session:       $session_id"
+  echo "Container:     $container"
+  echo "WebUI:         http://127.0.0.1:$port"
+  echo "Real repo:     $real_repo   (NOT mounted)"
+  echo "Staged repo:   $ws_copy -> container:$real_repo"
+  echo "Control DSH:   $control_source@$control_commit -> /control-dsh (read-only)"
+  echo "Control home:  $control_home -> /control-home (persistent staging)"
+  echo "Host DSH_HOME: $host_dsh_home (never mounted RW)"
+  if [[ "$use_credentials" == "true" && -d "$real_repo/$cred_rel" ]]; then
+    echo "Test creds:    $real_repo/$cred_rel -> $real_repo/$cred_rel (read-only overlay)"
+  else
+    echo "Test creds:    none"
+  fi
+  if [[ "$real_dirty" == "false" && -n "$origin" ]]; then
+    echo "PR readiness:  clean launch; session repo has origin=$origin"
+  else
+    echo "PR readiness:  local/dirty launch; use changes.patch unless you intentionally curate a PR"
+  fi
+  echo
+  echo "Recent DSH logs (including the current WebUI token/URL):"
+  echo "----------------------------------------------------------------"
+  docker logs --tail 100 "$container" 2>&1 || true
+  echo "----------------------------------------------------------------"
+  echo
+  echo "Commands:"
+  echo "  $PROGRAM logs $session_id"
+  echo "  $PROGRAM stop $session_id"
+  echo "  $PROGRAM resume $session_id"
+  echo "  $PROGRAM finish $session_id"
+}
+
+cmd_list() {
+  need_cmd docker
+  mkdir -p "$SESSIONS_DIR"
+  printf '%-44s %-9s %-10s %-6s %s\n' "SESSION" "CONTAINER" "FINISH" "PORT" "REAL REPO"
+  local id sd status
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    sd="$SESSIONS_DIR/$id"; [[ -f "$sd/meta.env" ]] || continue
+    load_meta "$sd"
+    status="stopped"
+    if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then status=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME"); fi
+    printf '%-44s %-9s %-10s %-6s %s\n' "$SESSION_ID" "$status" "${FINISH_STATUS:-open}" "$PORT" "$REAL_REPO"
+  done < <(session_dirs)
+}
+
+cmd_status() {
+  need_cmd docker
+  local sd status="not-created"
+  sd=$(resolve_session "${1:-}"); load_meta "$sd"
+  if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then status=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME"); fi
+  echo "Session:       $SESSION_ID"
+  echo "Container:     $status ($CONTAINER_NAME)"
+  echo "Finish:        ${FINISH_STATUS:-open}"
+  echo "WebUI:         http://127.0.0.1:$PORT"
+  echo "Real repo:     $REAL_REPO"
+  echo "Staged repo:   $WORKSPACE_COPY"
+  echo "Control source:$CONTROL_SOURCE@$CONTROL_COMMIT"
+  echo "Control home:  $CONTROL_HOME_COPY"
+  echo "Host DSH_HOME: $HOST_DSH_HOME"
+  echo "Patch:         $sd/changes.patch"
+  echo "Merge report:  $sd/history-merge-report.json"
+}
+
+cmd_logs() {
+  need_cmd docker
+  local sd
+  sd=$(resolve_session "${1:-}"); load_meta "$sd"
+  docker logs -f "$CONTAINER_NAME"
+}
+
+cmd_stop() {
+  need_cmd docker
+  local sd
+  sd=$(resolve_session "${1:-}"); load_meta "$sd"
+  if container_running "$CONTAINER_NAME"; then
+    info "Stopping $CONTAINER_NAME (DSH gets SIGTERM and can flush its append-only Session state)"
+    docker stop "$CONTAINER_NAME" >/dev/null
+  else
+    info "Container is already stopped. Staging data remains at: $sd"
+  fi
+  echo "Resume with: $PROGRAM resume $SESSION_ID"
+  echo "Finish with: $PROGRAM finish $SESSION_ID"
+}
+
+cmd_resume() {
+  need_cmd docker
+  local sd
+  sd=$(resolve_session "${1:-}"); load_meta "$sd"
+  [[ "${FINISH_STATUS:-open}" != "finished" ]] || die "Session is already finished. Create a new sandbox instead of resuming it."
+  check_control_source_unchanged "$CONTROL_SOURCE" "$CONTROL_COMMIT"
+  if container_running "$CONTAINER_NAME"; then
+    echo "Already running: http://127.0.0.1:$PORT"
+    return
+  fi
+  if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    port_in_use "$PORT" && die "Port $PORT is already listening on the WSL host"
+    info "Restarting existing container: $CONTAINER_NAME"
+    docker start "$CONTAINER_NAME" >/dev/null
+  else
+    run_container "$sd"
+  fi
+  echo "WebUI: http://127.0.0.1:$PORT"
+  docker logs --tail 80 "$CONTAINER_NAME" 2>&1 || true
+}
+
+cmd_finish() {
+  need_cmd docker; need_cmd git; need_cmd python3
+  local sd
+  sd=$(resolve_session "${1:-}"); load_meta "$sd"
+
+  if container_running "$CONTAINER_NAME"; then
+    info "Stopping control DSH before final persistence merge"
+    docker stop "$CONTAINER_NAME" >/dev/null
+  fi
+
+  info "Exporting code changes relative to the launch-time filesystem baseline"
+  local patch_ok=true patch=""
+  if patch=$(export_patch "$sd"); then
+    if [[ -s "$patch" ]]; then echo "Patch: $patch"; else echo "No Git-visible code changes."; fi
+  else
+    patch_ok=false
+    warn "Could not export changes.patch. The staged workspace is still preserved at $WORKSPACE_COPY"
+  fi
+
+  info "Merging canonical DSH conversation logs (append/add only) and attachments (add only)"
+  local merge_ok=true
+  if ! merge_durable_state "$sd"; then
+    merge_ok=false
+    warn "History merge was refused or interrupted. Nothing in staging is deleted."
+    warn "Review: $sd/history-merge-report.json"
+  fi
+
+  if [[ "$patch_ok" == "true" && "$merge_ok" == "true" ]]; then
+    # Replace the last FINISH_STATUS assignment by appending a newer shell assignment.
+    append_meta "$sd/meta.env" FINISH_STATUS "finished" FINISHED_AT "$(date -Is)"
+    echo
+    echo "FINISHED safely."
+    echo "- Code staging retained: $WORKSPACE_COPY"
+    echo "- Full control-home staging retained: $CONTROL_HOME_COPY"
+    echo "- Canonical conversations/attachments merged to: $HOST_DSH_HOME"
+    echo "- Settings, credentials, profiles, storages and cache were NOT written back."
+    [[ -s "$sd/changes.patch" ]] && echo "- Optional local apply: $PROGRAM apply $SESSION_ID"
+    echo "- When you no longer need the full staging archive: $PROGRAM clean $SESSION_ID"
+  else
+    append_meta "$sd/meta.env" FINISH_STATUS "incomplete" LAST_FINISH_ATTEMPT "$(date -Is)"
+    die "Finish is incomplete. Session staging is preserved; resolve the reported issue and run finish again."
+  fi
+}
+
+cmd_apply() {
+  need_cmd git
+  local sd
+  sd=$(resolve_session "${1:-}"); load_meta "$sd"
+  local patch="$sd/changes.patch"
+  [[ -f "$patch" ]] || { info "No patch yet; exporting now"; export_patch "$sd" >/dev/null || die "Could not export patch"; }
+  [[ -s "$patch" ]] || die "Patch is empty; nothing to apply"
+
+  info "Checking patch against the real repo (no writes yet)"
+  git -C "$REAL_REPO" apply --check --binary "$patch" \
+    || die "Patch does not apply cleanly. Real repo was not changed; keep the staged session or use its Git branch/PR."
+  git -C "$REAL_REPO" apply --binary "$patch"
+  echo "Applied successfully to: $REAL_REPO"
+  echo "Review with: git -C $(shell_quote "$REAL_REPO") status --short"
+}
+
+cmd_clean() {
+  need_cmd docker
+  local force=false query=""
+  while (($#)); do
+    case "$1" in
+      --force) force=true; shift ;;
+      -h|--help) echo "Usage: $PROGRAM clean [--force] [SESSION]"; return ;;
+      *) query="$1"; shift ;;
+    esac
+  done
+  local sd
+  sd=$(resolve_session "$query"); load_meta "$sd"
+  if container_running "$CONTAINER_NAME"; then die "Session is running. Stop it first: $PROGRAM stop $SESSION_ID"; fi
+  if [[ "${FINISH_STATUS:-open}" != "finished" && "$force" != "true" ]]; then
+    die "Session is not safely finished (${FINISH_STATUS:-open}). Refusing to delete staging. Run finish, or use clean --force only if you accept data loss."
+  fi
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  rm -rf -- "$sd"
+  echo "Removed staged session: $SESSION_ID"
+}
+
+main() {
+  mkdir -p "$SESSIONS_DIR"; chmod 700 "$STATE_ROOT" "$SESSIONS_DIR" 2>/dev/null || true
+  local cmd="${1:-start}"
+  case "$cmd" in
+    start) shift || true; cmd_start "$@" ;;
+    resume) shift || true; cmd_resume "$@" ;;
+    stop) shift || true; cmd_stop "$@" ;;
+    finish) shift || true; cmd_finish "$@" ;;
+    apply) shift || true; cmd_apply "$@" ;;
+    status) shift || true; cmd_status "$@" ;;
+    logs) shift || true; cmd_logs "$@" ;;
+    list) shift || true; cmd_list "$@" ;;
+    image-build) shift || true; build_image ;;
+    clean) shift || true; cmd_clean "$@" ;;
+    -h|--help|help) usage ;;
+    --version) echo "$PROGRAM $VERSION" ;;
+    -*) cmd_start "$@" ;;
+    *)
+      if [[ -d "$cmd" ]]; then shift || true; cmd_start "$cmd" "$@"; else die "Unknown command or workspace: $cmd"; fi
+      ;;
+  esac
+}
+
+main "$@"

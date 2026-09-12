@@ -636,7 +636,7 @@ run_container() {
           echo "agent-sandbox: GitHub auth config is mounted but not valid for github.com" >&2
           exit 78
         fi
-        # Writes only the ephemeral container user's ~/.gitconfig. The mounted
+        # Writes only the ephemeral container user home Git config. The mounted
         # GitHub CLI config stays read-only.
         gh auth setup-git --hostname github.com >/dev/null
       fi

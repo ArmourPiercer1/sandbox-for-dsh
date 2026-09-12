@@ -2,13 +2,14 @@
 set -Eeuo pipefail
 
 PROGRAM="agent-sandbox"
-VERSION="0.2.2-mvp"
+VERSION="0.2.3-mvp"
 STATE_ROOT="${AGENT_SANDBOX_STATE_ROOT:-${HOME}/.local/state/agent-sandbox}"
 SESSIONS_DIR="${STATE_ROOT}/sessions"
 DEFAULT_PORT="3181"
 DEFAULT_CONTROL_SOURCE="${AGENT_SANDBOX_CONTROL_SOURCE:-${HOME}/deepseek-harness}"
 DEFAULT_HOST_DSH_HOME="${AGENT_SANDBOX_DSH_HOME:-${HOME}/.dsh}"
 DEFAULT_CREDENTIALS_DIR="tests/test-credentials"
+DEFAULT_GITHUB_AUTH_DIR="${AGENT_SANDBOX_GITHUB_AUTH_DIR:-${HOME}/.config/agent-sandbox/gh}"
 RELAY_PORT="38080"
 IMAGE_BASE="${AGENT_SANDBOX_IMAGE:-dsh-agent-sandbox:mvp2}"
 
@@ -39,6 +40,9 @@ Start options:
                               excluded from the copy and mounted read-only
                               (default: tests/test-credentials; ignored if absent)
       --no-credentials        Do not mount a test credentials directory
+      --github-auth-dir PATH  Dedicated GitHub CLI config directory to mount read-only
+                              (default: ~/.config/agent-sandbox/gh)
+      --no-github-auth        Disable GitHub auth mounting for this session
       --image IMAGE           Docker image override
       --rebuild-image         Rebuild the default sandbox image before start
   -h, --help                  Show this help
@@ -73,6 +77,7 @@ Architecture:
     DSH_HOME=/control-home. The built-in workspace-write policy therefore targets the copy.
   - tests/deepseek-harness and tests/homes inside the workspace are ordinary RW test fixtures.
   - tests/test-credentials, if present, is a read-only overlay from the real project.
+  - Dedicated GitHub CLI auth, when configured, is mounted read-only at /run/agent-gh.
   - /var/run/docker.sock, the real HOME, and Windows drives are not mounted.
   - Container user matches the WSL user's UID/GID, is non-root, has no capabilities, and cannot
     gain privileges.
@@ -124,8 +129,14 @@ append_meta() {
 load_meta() {
   local session_dir="$1"
   [[ -f "$session_dir/meta.env" ]] || die "Missing session metadata: $session_dir/meta.env"
+  # 0.2.3 compatibility: old session metadata has no GitHub auth fields.
+  unset GITHUB_AUTH_DIR USE_GITHUB_AUTH
   # shellcheck disable=SC1090
   source "$session_dir/meta.env"
+  GITHUB_AUTH_DIR="${GITHUB_AUTH_DIR:-$DEFAULT_GITHUB_AUTH_DIR}"
+  if [[ -z "${USE_GITHUB_AUTH:-}" ]]; then
+    if [[ -f "$GITHUB_AUTH_DIR/hosts.yml" ]]; then USE_GITHUB_AUTH=true; else USE_GITHUB_AUTH=false; fi
+  fi
 }
 
 session_dirs() {
@@ -584,6 +595,9 @@ container_mount_args() {
   if [[ "$USE_CREDENTIALS" == "true" && -d "$REAL_REPO/$CRED_REL" ]]; then
     MOUNTS+=(--mount "type=bind,src=$REAL_REPO/$CRED_REL,dst=$WORKSPACE_MOUNT/$CRED_REL,readonly")
   fi
+  if [[ "${USE_GITHUB_AUTH:-false}" == "true" && -f "${GITHUB_AUTH_DIR:-}/hosts.yml" ]]; then
+    MOUNTS+=(--mount "type=bind,src=$GITHUB_AUTH_DIR,dst=/run/agent-gh,readonly")
+  fi
 }
 
 run_container() {
@@ -592,6 +606,10 @@ run_container() {
   check_control_source_unchanged "$CONTROL_SOURCE" "$CONTROL_COMMIT"
   port_in_use "$PORT" && die "Port $PORT is already listening on the WSL host"
   container_mount_args
+  local extra_env=()
+  if [[ "${USE_GITHUB_AUTH:-false}" == "true" && -f "${GITHUB_AUTH_DIR:-}/hosts.yml" ]]; then
+    extra_env+=(-e GH_CONFIG_DIR=/run/agent-gh -e AGENT_SANDBOX_GITHUB_AUTH=1)
+  fi
 
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   info "Starting container: $CONTAINER_NAME"
@@ -607,11 +625,21 @@ run_container() {
     -e DSH_PORT="$PORT" \
     -e RELAY_PORT="$RELAY_PORT" \
     -e WORKSPACE_PATH="$WORKSPACE_MOUNT" \
+    "${extra_env[@]}" \
     "${MOUNTS[@]}" \
     "$IMAGE" \
     bash -lc '
       set -Eeuo pipefail
       mkdir -p "$DSH_HOME"
+      if [[ "${AGENT_SANDBOX_GITHUB_AUTH:-0}" == "1" ]]; then
+        if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+          echo "agent-sandbox: GitHub auth config is mounted but not valid for github.com" >&2
+          exit 78
+        fi
+        # Writes only the ephemeral container user's ~/.gitconfig. The mounted
+        # GitHub CLI config stays read-only.
+        gh auth setup-git --hostname github.com >/dev/null
+      fi
       # DSH source execution relies on the control repository tsconfig path aliases.
       # cwd intentionally points at the staged project so workspace-write targets the copy;
       # therefore tsx must be told explicitly which tsconfig belongs to the DSH source tree.
@@ -645,7 +673,7 @@ cmd_start() {
   need_cmd docker; need_cmd git; need_cmd rsync; need_cmd python3
 
   local port="$DEFAULT_PORT" name="" control_source="$DEFAULT_CONTROL_SOURCE" host_dsh_home="$DEFAULT_HOST_DSH_HOME"
-  local cred_rel="$DEFAULT_CREDENTIALS_DIR" use_credentials=true rebuild=false image_override="" workspace_arg="."
+  local cred_rel="$DEFAULT_CREDENTIALS_DIR" use_credentials=true github_auth_dir="$DEFAULT_GITHUB_AUTH_DIR" use_github_auth=true rebuild=false image_override="" workspace_arg="."
 
   while (($#)); do
     case "$1" in
@@ -655,6 +683,8 @@ cmd_start() {
       --dsh-home) host_dsh_home="${2:?missing path}"; shift 2 ;;
       --credentials) cred_rel="${2:?missing path}"; shift 2 ;;
       --no-credentials) use_credentials=false; shift ;;
+      --github-auth-dir) github_auth_dir="${2:?missing path}"; shift 2 ;;
+      --no-github-auth) use_github_auth=false; shift ;;
       --image) image_override="${2:?missing image}"; shift 2 ;;
       --rebuild-image) rebuild=true; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -674,6 +704,12 @@ cmd_start() {
 
   control_source=$(realpath "$control_source")
   host_dsh_home=$(realpath -m "$host_dsh_home")
+  github_auth_dir=$(realpath -m "$github_auth_dir")
+  if [[ "$use_github_auth" == "true" && ! -f "$github_auth_dir/hosts.yml" ]]; then
+    warn "GitHub auth not configured at $github_auth_dir/hosts.yml; push/PR will be unavailable."
+    warn "Configure it with: GH_CONFIG_DIR=$(shell_quote "$github_auth_dir") gh auth login --hostname github.com --git-protocol https --insecure-storage"
+    use_github_auth=false
+  fi
   assert_control_source "$control_source"
   local control_commit
   control_commit=$(control_source_commit "$control_source")
@@ -732,6 +768,8 @@ cmd_start() {
     PORT "$port" \
     CRED_REL "$cred_rel" \
     USE_CREDENTIALS "$use_credentials" \
+    GITHUB_AUTH_DIR "$github_auth_dir" \
+    USE_GITHUB_AUTH "$use_github_auth" \
     IMAGE "$image" \
     CONTROL_SOURCE "$control_source" \
     CONTROL_COMMIT "$control_commit" \
@@ -759,6 +797,11 @@ cmd_start() {
     echo "Test creds:    $real_repo/$cred_rel -> $real_repo/$cred_rel (read-only overlay)"
   else
     echo "Test creds:    none"
+  fi
+  if [[ "$use_github_auth" == "true" ]]; then
+    echo "GitHub auth:   $github_auth_dir -> /run/agent-gh (read-only; HTTPS push/gh enabled)"
+  else
+    echo "GitHub auth:   none"
   fi
   if [[ "$real_dirty" == "false" && -n "$origin" ]]; then
     echo "PR readiness:  clean launch; session repo has origin=$origin"
@@ -807,6 +850,7 @@ cmd_status() {
   echo "Control source:$CONTROL_SOURCE@$CONTROL_COMMIT"
   echo "Control home:  $CONTROL_HOME_COPY"
   echo "Host DSH_HOME: $HOST_DSH_HOME"
+  echo "GitHub auth:   ${USE_GITHUB_AUTH:-false} (${GITHUB_AUTH_DIR:-none})"
   echo "Patch:         $sd/changes.patch"
   echo "Merge report:  $sd/history-merge-report.json"
 }

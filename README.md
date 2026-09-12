@@ -1,8 +1,8 @@
-# dsh-agent-sandbox
+# sandbox-for-dsh
 
 A small Docker-based adapter for running **DeepSeek Harness (DSH)** coding agents against a disposable copy of a Git workspace while keeping the real checkout out of the agent's writable filesystem.
 
-> **Current launcher version:** **0.2.2-mvp**
+> **Current launcher version:** **0.2.3-mvp**
 >
 > **Status:** experimental MVP. This project is designed primarily to contain destructive filesystem mistakes by autonomous coding agents. It is **not** a hardened anti-exfiltration or hostile-code sandbox.
 
@@ -10,7 +10,7 @@ A small Docker-based adapter for running **DeepSeek Harness (DSH)** coding agent
 
 Coding agents need broad freedom inside a project: editing files, rebuilding dependencies, switching test fixtures, running Playwright, resetting test repositories, and occasionally making destructive mistakes. Mounting a real repository read/write into a container does not protect it from `rm -rf`, `git clean -xfd`, a bad worktree cleanup, or an incorrect path expansion.
 
-`dsh-agent-sandbox` uses a different boundary:
+`sandbox-for-dsh` uses a different boundary:
 
 - the **real development repository is never mounted into the container**;
 - the agent works in a persistent, self-contained Git copy;
@@ -111,8 +111,8 @@ The Docker image is built automatically on first use and includes Node 24, Corep
 Clone this repository and put the launcher on your PATH:
 
 ```bash
-git clone https://github.com/ArmourPiercer1/dsh-agent-sandbox.git
-cd dsh-agent-sandbox
+git clone https://github.com/ArmourPiercer1/sandbox-for-dsh.git
+cd sandbox-for-dsh
 install -Dm755 agent-sandbox ~/.local/bin/agent-sandbox
 ```
 
@@ -211,6 +211,8 @@ Useful options:
     --dsh-home PATH         Real DSH_HOME snapshot source (default: ~/.dsh)
     --credentials PATH      Test credentials path inside project
     --no-credentials        Do not mount project test credentials
+    --github-auth-dir PATH  Dedicated GitHub CLI config directory (RO mount)
+    --no-github-auth        Disable GitHub auth mounting
     --image IMAGE           Use an existing custom image
     --rebuild-image         Rebuild the default image
 ```
@@ -339,7 +341,48 @@ This makes a PR-based workflow possible without modifying the real local checkou
 sandbox branch -> push -> PR -> review/fix in sandbox -> merge on GitHub -> host fetch/pull
 ```
 
-`gh` is installed in the image, but **GitHub authentication is not automatically inherited from the host**. This is deliberate. If the agent must push or open PRs, explicitly provide narrowly scoped GitHub credentials through your project/test credential mechanism and configure `git`/`gh` inside the sandbox. Do not mount your whole host `~/.ssh` or GitHub config just for convenience.
+`gh` is installed in the image. Since **0.2.3-mvp**, the launcher can mount a dedicated GitHub CLI configuration read-only and automatically configure HTTPS Git authentication inside the container.
+
+Create a sandbox-specific GitHub CLI config once on the host:
+
+```bash
+mkdir -p ~/.config/agent-sandbox/gh
+chmod 700 ~/.config/agent-sandbox/gh
+
+GH_CONFIG_DIR="$HOME/.config/agent-sandbox/gh" \
+  gh auth login --hostname github.com --git-protocol https --insecure-storage
+
+GH_CONFIG_DIR="$HOME/.config/agent-sandbox/gh" gh auth status
+```
+
+Use a narrowly scoped fine-grained PAT where possible: selected repositories only, with repository **Contents: read/write**, **Pull requests: read/write**, and **Metadata: read**. Protect important target branches on GitHub so the agent must work through PRs rather than direct pushes.
+
+At sandbox start, the launcher detects:
+
+```text
+~/.config/agent-sandbox/gh/hosts.yml
+```
+
+and mounts that directory read-only at:
+
+```text
+/run/agent-gh
+```
+
+with:
+
+```text
+GH_CONFIG_DIR=/run/agent-gh
+```
+
+The container then runs `gh auth setup-git --hostname github.com`, which writes only the ephemeral container user's `~/.gitconfig`; the mounted GitHub credential store itself stays read-only. This enables both:
+
+```bash
+git push -u origin HEAD
+gh pr create
+```
+
+Override the auth location with `--github-auth-dir PATH` or disable it for one run with `--no-github-auth`.
 
 The built-in `changes.patch` path remains a fallback even when you primarily use PRs.
 
@@ -371,6 +414,7 @@ Other environment overrides:
 ```bash
 AGENT_SANDBOX_CONTROL_SOURCE=/path/to/deepseek-harness
 AGENT_SANDBOX_DSH_HOME=/path/to/.dsh
+AGENT_SANDBOX_GITHUB_AUTH_DIR=/path/to/gh-config
 AGENT_SANDBOX_IMAGE=my-image:tag
 ```
 
@@ -379,7 +423,7 @@ AGENT_SANDBOX_IMAGE=my-image:tag
 - MVP/experimental; destructive edge cases still deserve backups.
 - Designed and tested around DSH's current append-only session persistence layout. Breaking DSH persistence changes may require updating the guarded merge logic.
 - The control source must remain at the same clean commit while a session is resumable.
-- GitHub PR authentication is intentionally not inherited automatically.
+- GitHub authentication uses a dedicated read-only GitHub CLI config directory; if none is configured, push/PR operations remain unavailable.
 - Global settings/profile/plugin-state changes made inside `control-home` are not promoted by `finish`.
 - Normal outbound networking is allowed.
 - If the agent destroys the staged Git metadata, the real repository is still safe, but automatic `changes.patch` export may no longer be possible.

@@ -2,6 +2,8 @@
 
 A small Docker-based adapter for running **DeepSeek Harness (DSH)** coding agents against a disposable copy of a Git workspace while keeping the real checkout out of the agent's writable filesystem.
 
+> **Current launcher version:** **0.2.2-mvp**
+>
 > **Status:** experimental MVP. This project is designed primarily to contain destructive filesystem mistakes by autonomous coding agents. It is **not** a hardened anti-exfiltration or hostile-code sandbox.
 
 ## Why

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 PROGRAM="agent-sandbox"
-VERSION="0.2.0-mvp"
+VERSION="0.2.2-mvp"
 STATE_ROOT="${AGENT_SANDBOX_STATE_ROOT:-${HOME}/.local/state/agent-sandbox}"
 SESSIONS_DIR="${STATE_ROOT}/sessions"
 DEFAULT_PORT="3181"
@@ -612,12 +612,16 @@ run_container() {
     bash -lc '
       set -Eeuo pipefail
       mkdir -p "$DSH_HOME"
+      # DSH source execution relies on the control repository tsconfig path aliases.
+      # cwd intentionally points at the staged project so workspace-write targets the copy;
+      # therefore tsx must be told explicitly which tsconfig belongs to the DSH source tree.
+      export TSX_TSCONFIG_PATH=/control-dsh/tsconfig.json
       tsx_loader="$(cd /control-dsh && node -p "require.resolve(\"tsx/esm\")")"
       socat TCP-LISTEN:"$RELAY_PORT",bind=0.0.0.0,fork,reuseaddr TCP:127.0.0.1:"$DSH_PORT" &
       relay_pid=$!
       trap "kill $relay_pid 2>/dev/null || true" EXIT
       cd "$WORKSPACE_PATH"
-      exec node --import "$tsx_loader" /control-dsh/apps/cli/src/bin.ts web --port "$DSH_PORT"
+      exec node --import "$tsx_loader" /control-dsh/apps/cli/src/bin.ts web --no-open --port "$DSH_PORT"
     ' >/dev/null
 
   local i
@@ -627,12 +631,12 @@ run_container() {
       docker logs --tail 160 "$CONTAINER_NAME" 2>&1 || true
       return 1
     fi
-    if docker exec "$CONTAINER_NAME" bash -lc "curl -sS --max-time 1 -o /dev/null http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+    if docker logs "$CONTAINER_NAME" 2>&1 | grep -q '^dsh web: http://'; then
       return 0
     fi
     sleep 1
   done
-  warn "Container is running but the DSH WebUI did not answer within 45 seconds."
+  warn "Container is running but DSH did not announce its authenticated WebUI URL within 45 seconds."
   docker logs --tail 160 "$CONTAINER_NAME" 2>&1 || true
   return 1
 }
@@ -744,7 +748,8 @@ cmd_start() {
   echo
   echo "Session:       $session_id"
   echo "Container:     $container"
-  echo "WebUI:         http://127.0.0.1:$port"
+  auth_url=$(docker logs "$container" 2>&1 | awk '/^dsh web: http:\/\// { print $3 }' | tail -n 1)
+  echo "WebUI:         ${auth_url:-http://127.0.0.1:$port}"
   echo "Real repo:     $real_repo   (NOT mounted)"
   echo "Staged repo:   $ws_copy -> container:$real_repo"
   echo "Control DSH:   $control_source@$control_commit -> /control-dsh (read-only)"
